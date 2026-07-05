@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <Company>Anoop Kumar Narayanan</Company>
+    <Product>CodeDetective WinForms Port</Product>
+    <Copyright>Copyright (c) Anoop Kumar Narayanan</Copyright>
+    <LangVersion>latest</LangVersion>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>
