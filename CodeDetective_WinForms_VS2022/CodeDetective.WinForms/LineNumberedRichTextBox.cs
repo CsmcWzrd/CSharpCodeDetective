@@ -21,6 +21,12 @@ public sealed class LineNumberedRichTextBox : UserControl
     private bool _isHighlighting;
     private bool _highlightQueued;
 
+    public string DocumentFilePath
+    {
+        get => _filePath;
+        set => _filePath = value ?? string.Empty;
+    }
+
     public RichTextBox Editor { get; } = new()
     {
         Dock = DockStyle.Fill,

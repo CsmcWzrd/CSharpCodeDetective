@@ -32,6 +32,7 @@ public sealed class MainForm : Form
     private string? _projectPath;
     private string? _currentFile;
     private int _currentLine = 1;
+    private int _untitledCounter = 1;
 
     public MainForm()
     {
@@ -42,6 +43,7 @@ public sealed class MainForm : Form
         Icon = LoadIconSafely();
         BuildMenus();
         BuildLayout();
+        FormClosing += MainForm_FormClosing;
     }
 
     private Icon? LoadIconSafely()
@@ -59,6 +61,16 @@ public sealed class MainForm : Form
     {
         var menu = new MenuStrip();
         MainMenuStrip = menu;
+
+        var fileMenu = new ToolStripMenuItem("File");
+        fileMenu.DropDownItems.Add(Item("New Text Window", Keys.Control | Keys.N, (_, _) => NewTextWindow()));
+        fileMenu.DropDownItems.Add(Item("Open File", Keys.Control | Keys.O, (_, _) => OpenFileDialogForEditor()));
+        fileMenu.DropDownItems.Add(new ToolStripSeparator());
+        fileMenu.DropDownItems.Add(Item("Save", Keys.Control | Keys.S, (_, _) => SaveCurrentEditorFile()));
+        fileMenu.DropDownItems.Add(Item("Save As", Keys.Control | Keys.Shift | Keys.S, (_, _) => SaveCurrentEditorFileAs()));
+        fileMenu.DropDownItems.Add(Item("Save Backup Copy", null, (_, _) => SaveCurrentEditorBackup()));
+        fileMenu.DropDownItems.Add(new ToolStripSeparator());
+        fileMenu.DropDownItems.Add(Item("Close Current Tab", Keys.Control | Keys.W, (_, _) => CloseCurrentEditorTab()));
 
         var project = new ToolStripMenuItem("Project");
         project.DropDownItems.Add(Item("Open Project", null, (_, _) => OpenProjectDialog()));
@@ -92,7 +104,7 @@ public sealed class MainForm : Form
         var help = new ToolStripMenuItem("Help");
         help.DropDownItems.Add(Item("About", null, (_, _) => ShowAbout()));
 
-        menu.Items.AddRange(new ToolStripItem[] { project, study, bookmarks, find, ctags, help });
+        menu.Items.AddRange(new ToolStripItem[] { fileMenu, project, study, bookmarks, find, ctags, help });
         Controls.Add(menu);
     }
 
@@ -198,10 +210,18 @@ public sealed class MainForm : Form
         if (page == _editorTabs.TabPages[0]) return;
         if (page.Tag is EditorInfo info)
         {
-            _study.AddEntry("Opened/Closed Files:", StudyEntry.Open(Path.GetFileName(info.FilePath), _currentLine, "Closed", info.FilePath));
+            if (!PromptSaveIfDirty(info)) return;
+            var displayName = info.DisplayName;
+            var filePath = info.FilePath ?? string.Empty;
+            _study.AddEntry("Opened/Closed Files:", StudyEntry.Open(displayName, _currentLine, "Closed", filePath));
         }
         _editorTabs.TabPages.Remove(page);
         page.Dispose();
+    }
+
+    private void CloseCurrentEditorTab()
+    {
+        if (_editorTabs.SelectedTab != null && _editorTabs.SelectedIndex > 0) CloseEditorTab(_editorTabs.SelectedTab);
     }
 
     private void OpenProjectDialog()
@@ -233,10 +253,21 @@ public sealed class MainForm : Form
 
     private void CloseProject()
     {
+        foreach (var page in _editorTabs.TabPages.Cast<TabPage>().Where(p => p.Tag is EditorInfo).ToList())
+        {
+            if (page.Tag is EditorInfo info && !PromptSaveIfDirty(info)) return;
+        }
+
         _projectPath = null;
         _projectTree.Nodes.Clear();
-        _editorTabs.TabPages.Cast<TabPage>().Where(p => p.Tag is EditorInfo).ToList().ForEach(p => _editorTabs.TabPages.Remove(p));
+        _editorTabs.TabPages.Cast<TabPage>().Where(p => p.Tag is EditorInfo).ToList().ForEach(p =>
+        {
+            _editorTabs.TabPages.Remove(p);
+            p.Dispose();
+        });
         _study.Clear();
+        _currentFile = null;
+        _currentLine = 1;
         SetStatus("Project closed");
     }
 
@@ -274,10 +305,38 @@ public sealed class MainForm : Form
         return _codeExtensions.Contains(ext) || string.Equals(Path.GetFileName(path), "Makefile", StringComparison.OrdinalIgnoreCase);
     }
 
+    private void NewTextWindow()
+    {
+        var editorView = CreateEditorView(null, string.Empty, out var info);
+        info.UntitledName = $"Untitled {_untitledCounter++}";
+        var page = new TabPage(info.UntitledName) { Tag = info };
+        info.Page = page;
+        page.Controls.Add(editorView);
+        _editorTabs.TabPages.Add(page);
+        _editorTabs.SelectedTab = page;
+        editorView.Editor.Focus();
+        _currentFile = null;
+        _currentLine = 1;
+        SetStatus("New untitled text window opened");
+    }
+
+    private void OpenFileDialogForEditor()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Open text/source file",
+            Filter = "Text and source files|*.txt;*.log;*.md;*.json;*.xml;*.yaml;*.yml;*.ini;*.cfg;*.c;*.h;*.cpp;*.hpp;*.cxx;*.hxx;*.cs;*.java;*.py;*.js;*.ts;*.go;*.rs;*.sh;*.bat;*.ps1|All files|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+        if (dialog.ShowDialog(this) == DialogResult.OK) OpenFileInEditor(dialog.FileName, 1);
+    }
+
     private void OpenFileInEditor(string file, int line)
     {
         if (!File.Exists(file)) { SetStatus($"File not found: {file}"); return; }
-        var existing = _editorTabs.TabPages.Cast<TabPage>().FirstOrDefault(p => p.Tag is EditorInfo i && string.Equals(i.FilePath, file, StringComparison.OrdinalIgnoreCase));
+        var fullPath = Path.GetFullPath(file);
+        var existing = _editorTabs.TabPages.Cast<TabPage>().FirstOrDefault(p => p.Tag is EditorInfo i && i.FilePath != null && string.Equals(i.FilePath, fullPath, StringComparison.OrdinalIgnoreCase));
         if (existing != null)
         {
             _editorTabs.SelectedTab = existing;
@@ -285,35 +344,190 @@ public sealed class MainForm : Form
             return;
         }
 
+        string text;
+        try { text = File.ReadAllText(fullPath); }
+        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Open file failed", MessageBoxButtons.OK, MessageBoxIcon.Error); return; }
+
+        var editorView = CreateEditorView(fullPath, text, out var newInfo);
+        var page = new TabPage(Path.GetFileName(fullPath)) { Tag = newInfo };
+        newInfo.Page = page;
+        page.Controls.Add(editorView);
+        _editorTabs.TabPages.Add(page);
+        _editorTabs.SelectedTab = page;
+        _currentFile = fullPath;
+        GoToLine(newInfo.Editor, line);
+        _study.AddEntry("Opened/Closed Files:", StudyEntry.Open(Path.GetFileName(fullPath), line, "Opened", fullPath));
+        SetStatus($"Opened {fullPath}");
+    }
+
+    private LineNumberedRichTextBox CreateEditorView(string? filePath, string text, out EditorInfo info)
+    {
         var editorView = new LineNumberedRichTextBox { Dock = DockStyle.Fill };
         var editor = editorView.Editor;
-        editorView.LoadText(File.ReadAllText(file), file);
-        editor.SelectionChanged += (_, _) => UpdateCurrentLine(editor, file);
+        info = new EditorInfo(filePath, editorView, editor);
+        var editorInfo = info;
+        editorView.LoadText(text, filePath ?? string.Empty);
+        editorInfo.IsDirty = false;
+
+        editor.SelectionChanged += (_, _) => UpdateCurrentLine(editor, editorInfo.FilePath);
+        editor.TextChanged += (_, _) =>
+        {
+            if (editorInfo.SuppressDirty) return;
+            if (!editorInfo.IsDirty)
+            {
+                editorInfo.IsDirty = true;
+                UpdateEditorTabTitle(editorInfo);
+            }
+        };
         editor.KeyDown += (_, e) =>
         {
             if (e.Control && e.KeyCode == Keys.S)
             {
-                File.WriteAllText(file, editor.Text);
+                if (e.Shift) SaveEditorFileAs(editorInfo);
+                else SaveEditorFile(editorInfo);
                 e.SuppressKeyPress = true;
-                SetStatus($"Saved {file}");
             }
         };
-
-        var page = new TabPage(Path.GetFileName(file));
-        page.Tag = new EditorInfo(file, editor);
-        page.Controls.Add(editorView);
-        _editorTabs.TabPages.Add(page);
-        _editorTabs.SelectedTab = page;
-        _currentFile = file;
-        GoToLine(editor, line);
-        _study.AddEntry("Opened/Closed Files:", StudyEntry.Open(Path.GetFileName(file), line, "Opened", file));
-        SetStatus($"Opened {file}");
+        return editorView;
     }
 
-    private void UpdateCurrentLine(RichTextBox editor, string file)
+    private void UpdateCurrentLine(RichTextBox editor, string? file)
     {
         _currentFile = file;
         _currentLine = editor.GetLineFromCharIndex(editor.SelectionStart) + 1;
+    }
+
+    private EditorInfo? CurrentEditorInfo()
+    {
+        return _editorTabs.SelectedTab?.Tag as EditorInfo;
+    }
+
+    private void SaveCurrentEditorFile()
+    {
+        var info = CurrentEditorInfo();
+        if (info == null) { SetStatus("No editable source tab is selected"); return; }
+        SaveEditorFile(info);
+    }
+
+    private void SaveCurrentEditorFileAs()
+    {
+        var info = CurrentEditorInfo();
+        if (info == null) { SetStatus("No editable source tab is selected"); return; }
+        SaveEditorFileAs(info);
+    }
+
+    private void SaveCurrentEditorBackup()
+    {
+        var info = CurrentEditorInfo();
+        if (info == null) { SetStatus("No editable source tab is selected"); return; }
+        SaveEditorBackup(info);
+    }
+
+    private bool SaveEditorFile(EditorInfo info)
+    {
+        if (string.IsNullOrWhiteSpace(info.FilePath)) return SaveEditorFileAs(info);
+        try
+        {
+            File.WriteAllText(info.FilePath, info.Editor.Text);
+            MarkSaved(info);
+            SetStatus($"Saved {info.FilePath}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Save failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
+    private bool SaveEditorFileAs(EditorInfo info)
+    {
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Save file as",
+            Filter = "Text and source files|*.txt;*.cs;*.c;*.h;*.cpp;*.hpp;*.java;*.py;*.js;*.ts;*.md;*.json;*.xml;*.log|All files|*.*",
+            FileName = string.IsNullOrWhiteSpace(info.FilePath) ? info.UntitledName : Path.GetFileName(info.FilePath),
+            InitialDirectory = !string.IsNullOrWhiteSpace(info.FilePath) ? Path.GetDirectoryName(info.FilePath) : _projectPath
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return false;
+        try
+        {
+            var fullPath = Path.GetFullPath(dialog.FileName);
+            File.WriteAllText(fullPath, info.Editor.Text);
+            info.FilePath = fullPath;
+            MarkSaved(info);
+            SetStatus($"Saved as {fullPath}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Save As failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
+    private bool SaveEditorBackup(EditorInfo info)
+    {
+        var backupPath = BuildBackupPath(info);
+        if (string.IsNullOrWhiteSpace(backupPath)) return false;
+        try
+        {
+            File.WriteAllText(backupPath, info.Editor.Text);
+            SetStatus($"Backup saved: {backupPath}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "Save backup failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
+
+    private string? BuildBackupPath(EditorInfo info)
+    {
+        var suffix = DateTime.Now.ToString("_bkp_yyyy_MM_dd__HH_mm_ss");
+        if (!string.IsNullOrWhiteSpace(info.FilePath))
+        {
+            var dir = Path.GetDirectoryName(info.FilePath)!;
+            var name = Path.GetFileNameWithoutExtension(info.FilePath);
+            var ext = Path.GetExtension(info.FilePath);
+            return Path.Combine(dir, name + suffix + ext);
+        }
+
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Save untitled backup copy",
+            Filter = "Text files|*.txt|All files|*.*",
+            FileName = (string.IsNullOrWhiteSpace(info.UntitledName) ? "Untitled" : info.UntitledName.Replace(' ', '_')) + suffix + ".txt",
+            InitialDirectory = _projectPath
+        };
+        return dialog.ShowDialog(this) == DialogResult.OK ? Path.GetFullPath(dialog.FileName) : null;
+    }
+
+    private void MarkSaved(EditorInfo info)
+    {
+        info.IsDirty = false;
+        info.EditorView.DocumentFilePath = info.FilePath ?? string.Empty;
+        info.SuppressDirty = true;
+        info.EditorView.ApplySyntaxHighlighting();
+        info.SuppressDirty = false;
+        UpdateEditorTabTitle(info);
+    }
+
+    private void UpdateEditorTabTitle(EditorInfo info)
+    {
+        if (info.Page == null) return;
+        info.Page.Text = (info.IsDirty ? "*" : "") + info.DisplayName;
+        _editorTabs.Invalidate();
+    }
+
+    private bool PromptSaveIfDirty(EditorInfo info)
+    {
+        if (!info.IsDirty) return true;
+        var result = MessageBox.Show(this, $"Save changes to {info.DisplayName}?", "Unsaved changes", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+        if (result == DialogResult.Cancel) return false;
+        if (result == DialogResult.No) return true;
+        return SaveEditorFile(info);
     }
 
     private static void GoToLine(RichTextBox editor, int line)
@@ -522,7 +736,10 @@ public sealed class MainForm : Form
     private void SaveOpenTabsInStudy()
     {
         foreach (var info in _editorTabs.TabPages.Cast<TabPage>().Select(p => p.Tag).OfType<EditorInfo>())
+        {
+            if (string.IsNullOrWhiteSpace(info.FilePath)) continue;
             _study.AddEntry("Opened/Closed Files:", StudyEntry.Open(Path.GetFileName(info.FilePath), 1, "Opened", info.FilePath));
+        }
         SetStatus("Open tabs saved in study");
     }
 
@@ -587,6 +804,18 @@ public sealed class MainForm : Form
         _statusText.Text = text;
     }
 
+    private void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+    {
+        foreach (var info in _editorTabs.TabPages.Cast<TabPage>().Select(p => p.Tag).OfType<EditorInfo>())
+        {
+            if (!PromptSaveIfDirty(info))
+            {
+                e.Cancel = true;
+                return;
+            }
+        }
+    }
+
     private void ShowAbout()
     {
         MessageBox.Show(this,
@@ -594,6 +823,25 @@ public sealed class MainForm : Form
             "About CodeDetective", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
-    private sealed record EditorInfo(string FilePath, RichTextBox Editor);
+    private sealed class EditorInfo
+    {
+        public EditorInfo(string? filePath, LineNumberedRichTextBox editorView, RichTextBox editor)
+        {
+            FilePath = filePath;
+            EditorView = editorView;
+            Editor = editor;
+            UntitledName = "Untitled";
+        }
+
+        public string? FilePath { get; set; }
+        public LineNumberedRichTextBox EditorView { get; }
+        public RichTextBox Editor { get; }
+        public TabPage? Page { get; set; }
+        public bool IsDirty { get; set; }
+        public bool SuppressDirty { get; set; }
+        public string UntitledName { get; set; }
+        public string DisplayName => string.IsNullOrWhiteSpace(FilePath) ? UntitledName : Path.GetFileName(FilePath);
+    }
+
     private sealed record Bookmark(string FilePath, int Line);
 }
