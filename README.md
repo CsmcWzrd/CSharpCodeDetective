@@ -7,5 +7,5 @@ Copy ctags.exe to the project folder.
 Build ctags from CodeDetective Menu.    
 Search for Identifiers using find tags.        
 
-Designed by Anoop Kumar Narayanan
-ChatGPT 5.5 Coded
+Designed by Anoop Kumar Narayanan     
+ChatGPT 5.5 Coded     
