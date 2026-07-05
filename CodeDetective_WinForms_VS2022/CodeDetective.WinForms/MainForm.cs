@@ -24,7 +24,7 @@ public sealed class MainForm : Form
     private readonly StudyView _study = new() { Dock = DockStyle.Fill };
     private readonly TextBox _studyFileName = new() { Dock = DockStyle.Fill, PlaceholderText = "Load/Save Study name. Blank = project.study" };
     private readonly List<Bookmark> _bookmarks = new();
-    private readonly List<string> _codeExtensions = new(StringComparer.OrdinalIgnoreCase)
+    private readonly HashSet<string> _codeExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".cpp", ".hpp", ".c++", ".h++", ".cxx", ".hxx", ".c", ".h", ".cs", ".java", ".py", ".js", ".ts", ".go", ".rs"
     };
@@ -66,7 +66,7 @@ public sealed class MainForm : Form
         project.DropDownItems.Add(Item("Close Project", null, (_, _) => CloseProject()));
 
         var study = new ToolStripMenuItem("Study");
-        study.DropDownItems.Add(Item("View Study", Keys.F1, (_, _) => _editorTabs.SelectedTab = _editorTabs.TabPages[0]));
+        study.DropDownItems.Add(Item("View Home / Study", Keys.F1, (_, _) => _editorTabs.SelectedTab = _editorTabs.TabPages[0]));
         study.DropDownItems.Add(Item("Add Note/Todo/Code", Keys.F3, (_, _) => AddRecordDialog()));
         study.DropDownItems.Add(Item("Save Open Tabs in Study", null, (_, _) => SaveOpenTabsInStudy()));
         study.DropDownItems.Add(Item("Save Study", null, (_, _) => SaveStudy()));
@@ -112,6 +112,11 @@ public sealed class MainForm : Form
         Controls.Add(_status);
         _status.Dock = DockStyle.Bottom;
 
+        _editorTabs.DrawMode = TabDrawMode.OwnerDrawFixed;
+        _editorTabs.Padding = new Point(22, 4);
+        _editorTabs.DrawItem += DrawEditorTab;
+        _editorTabs.MouseDown += EditorTabsMouseDown;
+
         _splitter.Panel1.Controls.Add(_leftTabs);
         _splitter.Panel2.Controls.Add(_editorTabs);
         Controls.Add(_splitter);
@@ -128,7 +133,7 @@ public sealed class MainForm : Form
             if (e.Node?.Tag is string path && File.Exists(path)) OpenFileInEditor(path, 1);
         };
 
-        var studyPage = new TabPage("Study");
+        var studyPage = new TabPage("Home");
         var studyPanel = new Panel { Dock = DockStyle.Fill };
         var top = new TableLayoutPanel { Dock = DockStyle.Top, Height = 34, ColumnCount = 3 };
         top.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -147,6 +152,56 @@ public sealed class MainForm : Form
         _editorTabs.TabPages.Add(studyPage);
 
         _study.OpenEntryRequested += (_, e) => OpenFileInEditor(e.FilePath, e.Line);
+    }
+
+    private void DrawEditorTab(object? sender, DrawItemEventArgs e)
+    {
+        var page = _editorTabs.TabPages[e.Index];
+        var rect = _editorTabs.GetTabRect(e.Index);
+        var isSelected = e.Index == _editorTabs.SelectedIndex;
+
+        using var back = new SolidBrush(isSelected ? SystemColors.Window : SystemColors.Control);
+        e.Graphics.FillRectangle(back, rect);
+
+        var textRect = Rectangle.Inflate(rect, -6, -3);
+        var canClose = e.Index > 0;
+        if (canClose) textRect.Width -= 18;
+        TextRenderer.DrawText(e.Graphics, page.Text, Font, textRect, SystemColors.ControlText, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+
+        if (canClose)
+        {
+            var closeRect = CloseButtonRect(e.Index);
+            TextRenderer.DrawText(e.Graphics, "x", Font, closeRect, Color.DarkRed, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+
+        e.DrawFocusRectangle();
+    }
+
+    private Rectangle CloseButtonRect(int tabIndex)
+    {
+        var rect = _editorTabs.GetTabRect(tabIndex);
+        return new Rectangle(rect.Right - 20, rect.Top + 4, 16, rect.Height - 8);
+    }
+
+    private void EditorTabsMouseDown(object? sender, MouseEventArgs e)
+    {
+        for (var i = 1; i < _editorTabs.TabPages.Count; i++)
+        {
+            if (!CloseButtonRect(i).Contains(e.Location)) continue;
+            CloseEditorTab(_editorTabs.TabPages[i]);
+            break;
+        }
+    }
+
+    private void CloseEditorTab(TabPage page)
+    {
+        if (page == _editorTabs.TabPages[0]) return;
+        if (page.Tag is EditorInfo info)
+        {
+            _study.AddEntry("Opened/Closed Files:", StudyEntry.Open(Path.GetFileName(info.FilePath), _currentLine, "Closed", info.FilePath));
+        }
+        _editorTabs.TabPages.Remove(page);
+        page.Dispose();
     }
 
     private void OpenProjectDialog()
@@ -230,16 +285,9 @@ public sealed class MainForm : Form
             return;
         }
 
-        var editor = new RichTextBox
-        {
-            Dock = DockStyle.Fill,
-            Font = new Font("Consolas", 9f),
-            WordWrap = false,
-            AcceptsTab = true,
-            HideSelection = false,
-            DetectUrls = false,
-            Text = File.ReadAllText(file)
-        };
+        var editorView = new LineNumberedRichTextBox { Dock = DockStyle.Fill };
+        var editor = editorView.Editor;
+        editorView.LoadText(File.ReadAllText(file), file);
         editor.SelectionChanged += (_, _) => UpdateCurrentLine(editor, file);
         editor.KeyDown += (_, e) =>
         {
@@ -253,7 +301,7 @@ public sealed class MainForm : Form
 
         var page = new TabPage(Path.GetFileName(file));
         page.Tag = new EditorInfo(file, editor);
-        page.Controls.Add(editor);
+        page.Controls.Add(editorView);
         _editorTabs.TabPages.Add(page);
         _editorTabs.SelectedTab = page;
         _currentFile = file;
@@ -438,7 +486,7 @@ public sealed class MainForm : Form
                         _ = int.TryParse(lineText, out var lineNo);
                         var file = Path.Combine(_projectPath!, fields[1].Replace('/', Path.DirectorySeparatorChar));
                         var type = CtagsKindName(fields[3]);
-                        BeginInvoke((Action)(() => _study.AddEntry("Ctags Results:", StudyEntry.Open(Path.GetFileName(file), Math.Max(1, lineNo), $"{tag} is {type}", file))));
+                        BeginInvoke((Action)(() => _study.AddEntry("Ctags Results:", StudyEntry.WithBody(Path.GetFileName(file), Math.Max(1, lineNo), tag, file, type))));
                     }
                 }
                 ReportProgress(i + 1, lines.Count);
